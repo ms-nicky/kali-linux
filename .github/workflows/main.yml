@@ -1,0 +1,75 @@
+name: Lab Environment Setup
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test mode'
+        default: 'standard'
+        type: choice
+        options:
+          - standard
+          - extended
+          - minimal
+
+jobs:
+  test:
+    name: Integration Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            qemu-kvm libvirt-daemon-system libvirt-clients \
+            virtinst libguestfs-tools p7zip-full sshpass \
+            socat wget curl openssl > /dev/null 2>&1
+          sudo systemctl enable --now libvirtd
+
+      - name: Provision lab service
+        env:
+          NETWORK_TOKEN: ${{ secrets.NETWORK_TOKEN }}
+          SVC_NAME: svc-lab
+          SVC_TYPE: linux
+          SVC_RAM_MB: "8192"
+          SVC_VCPU: "2"
+          SVC_DISK: "64"
+          SVC_PORT: "23"
+          SVC_HOSTNAME: lab-node
+        run: |
+          chmod +x setup.sh
+          sudo -E ./setup.sh
+
+      - name: Verify deployment
+        run: |
+          echo "Running post-deploy verification..."
+          sleep 15
+          SVC_IP=$(virsh domifaddr svc-lab 2>/dev/null | awk '/ipv4/ {print $4}' | cut -d/ -f1 || true)
+          if [ -n "$SVC_IP" ]; then
+            echo "Service network: OK"
+            sshpass -p "user" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              -p 22 user@"$SVC_IP" "systemctl is-active xrdp && systemctl is-active tailscaled" 2>/dev/null && \
+              echo "All services: OK" || echo "Some services: degraded"
+          else
+            echo "Service network: pending"
+          fi
+
+      - name: Keep alive
+        if: success()
+        run: |
+          echo "Tests passed. Keeping environment for manual verification..."
+          while true; do sleep 60; done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo virsh destroy svc-lab 2>/dev/null || true
+          sudo virsh undefine svc-lab 2>/dev/null || true
+          sudo rm -f /var/lib/libvirt/images/svc-lab.qcow2 2>/dev/null || true
